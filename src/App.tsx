@@ -90,6 +90,20 @@ const EQUIPMENT_LIST_ENABLED = Boolean(
     .data?.model_introspection?.models?.Equipmentlist
 );
 
+// Location.fitting only exists in AppSync once the updated backend schema has
+// been deployed (npx ampx sandbox / pipeline-deploy) and amplify_outputs.json
+// regenerated. Gate GraphQL selection sets on this so existing points still load
+// if the frontend runs before the backend is redeployed.
+const FITTING_FIELD_ENABLED = Boolean(
+  (outputs as {
+    data?: {
+      model_introspection?: {
+        models?: { Location?: { fields?: Record<string, unknown> } };
+      };
+    };
+  }).data?.model_introspection?.models?.Location?.fields?.fitting
+);
+
 type EquipmentItem = {
   id: string;
   primesub?: string | null;
@@ -149,9 +163,15 @@ function photoFileName(path: string): string {
 const locationSelectionSet = [
   'id', 'date', 'time', 'track', 'type', 'diameter',
   'width', 'length', 'lengthfield', 'lengthoverwrite', 'lat', 'lng', 'username', 'description',
-  'photos', 'joint', 'station', 'createdAt', 'updatedAt',
+  'photos', 'joint', 'station', 'fitting', 'createdAt', 'updatedAt',
 ] as const;
 type LocationItem = SelectionSet<Schema['Location']['type'], typeof locationSelectionSet>;
+
+const activeLocationSelectionSet = FITTING_FIELD_ENABLED
+  ? locationSelectionSet
+  : locationSelectionSet.filter(
+      (f): f is Exclude<(typeof locationSelectionSet)[number], 'fitting'> => f !== 'fitting'
+    );
 
 const dateSelectionSet = [
   'id', 'date', 'weather', 'hight', 'lowt', 'supervisor',
@@ -222,6 +242,29 @@ const TYPE_TO_TYPEID: Record<string, string> = Object.fromEntries(
     .filter(r => r.type)
     .map(r => [r.type, r.typeid ?? r.typeid1] as [string, string])
 );
+
+const PIPE_FITTING_TYPEIDS = new Set(['#0-45', '#0-46']);
+
+function supportsFitting(typeValue?: string | null): boolean {
+  return Boolean(typeValue && PIPE_FITTING_TYPEIDS.has(TYPE_TO_TYPEID[typeValue] ?? ''));
+}
+
+const FITTING_OPTIONS = [...TRACK_DATA]
+  .filter(r => r.typeid === '#0-6')
+  .sort((a, b) => (a.id == null ? Infinity : Number(a.id)) - (b.id == null ? Infinity : Number(b.id)))
+  .map(r => ({
+    value: r.type,
+    label: `${r.typeid1} ${r.type}`,
+  }));
+
+const FITTING_LABEL_MAP: Record<string, string> = Object.fromEntries(
+  FITTING_OPTIONS.map(o => [o.value, o.label] as [string, string])
+);
+
+function formatFittingLabel(fittingValue?: string | null): string {
+  if (!fittingValue) return '';
+  return FITTING_LABEL_MAP[fittingValue] ?? fittingValue;
+}
 
 type TrackCheckRow = {
   track: number;
@@ -300,7 +343,7 @@ type LenPoint = {
 // whole cached record with that message - so a mutation returning just
 // { id length } would blank the point's lat/lng (dropping it from the map)
 // and its other columns until the page is reloaded.
-const LOCATION_MUTATION_FIELDS = locationSelectionSet.join(' ');
+const LOCATION_MUTATION_FIELDS = activeLocationSelectionSet.join(' ');
 
 const UPDATE_LOCATION_FULL = /* GraphQL */ `
   mutation UpdateLocation($input: UpdateLocationInput!) {
@@ -398,6 +441,7 @@ function App() {
           lengthfield: loc.lengthfield ?? null,
           description: loc.description ?? '',
           joint:       loc.joint ?? null,
+          fitting:     loc.fitting ?? null,
         },
       })),
   }), [location]);
@@ -407,6 +451,7 @@ function App() {
   //const [report, setReport] = useState("");
   const [track, setTrack] = useState<number>(0);
   const [type, setType] = useState<string>(TRACK_DATA[0]?.type ?? "");
+  const [fitting, setFitting] = useState<string>("");
   const [diameter, setDiameter] = useState<number>(0);
   const [width, setWidth] = useState<number>(0);
   const [length, setLength] = useState<number>(0);
@@ -539,7 +584,7 @@ function App() {
 
   //const { data } = useGeoJSON();
   const [popupInfo, setPopupInfo] = useState<PopupInfo | null>(null);
-  const [hoverInfo, setHoverInfo] = useState<{ longitude: number; latitude: number; track: string; date: string; type: string; length: number | null; lengthfield: number | null } | null>(null);
+  const [hoverInfo, setHoverInfo] = useState<{ longitude: number; latitude: number; track: string; date: string; type: string; fitting: string | null; length: number | null; lengthfield: number | null } | null>(null);
   const [cursor, setCursor] = useState<string>('grab');
   const [measureMode, setMeasureMode] = useState(false);
   const [measurePoints, setMeasurePoints] = useState<[number, number][]>([]);
@@ -559,6 +604,7 @@ function App() {
   const [editLengthField, setEditLengthField] = useState<string>('');
   const [editLengthOverwrite, setEditLengthOverwrite] = useState<boolean>(false);
   const [editType, setEditType] = useState<string>('reuse');
+  const [editFitting, setEditFitting] = useState<string>('');
   const [editJoint, setEditJoint] = useState<string>("joint");
   const [editStation, setEditStation] = useState<string>('');
   const [editDate, setEditDate] = useState<string>('');
@@ -771,6 +817,9 @@ function App() {
   const handleSelectChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
     const value = event.target.value;
     setType(value);
+    if (!supportsFitting(value)) {
+      setFitting("");
+    }
     if (date && !dateInfoListRef.current.some(item => item.date === date)) {
       client.models.Date.create({ date });
       setDiWeather("");
@@ -811,9 +860,9 @@ function App() {
     // crashes with "Cannot read properties of null (reading 'id')" whenever
     // a record is updated and comments is null.
     const sub = client.models.Location.observeQuery({
-      selectionSet: [...locationSelectionSet],
+      selectionSet: [...activeLocationSelectionSet],
     }).subscribe({
-      next: (data) => setLocation([...data.items]),
+      next: (data) => setLocation([...(data.items as LocationItem[])]),
       error: (err) => console.error('observeQuery error:', err),
     });
     return () => sub.unsubscribe();
@@ -900,6 +949,15 @@ function App() {
       return;
     }
 
+    const fittingValue = supportsFitting(type) && fitting ? fitting : undefined;
+    if (fittingValue && !FITTING_FIELD_ENABLED) {
+      alert(
+        "The 'fitting' field has not been deployed to the backend yet.\n\n" +
+        "Run 'npx ampx sandbox' (or deploy the backend) so amplify_outputs.json includes Location.fitting, then reload."
+      );
+      return;
+    }
+
     handleUserName();
     const name = userName;
     // Normalize the time value for the GraphQL Time scalar. The HTML time input
@@ -920,6 +978,7 @@ function App() {
       lng: lng,
       joint: joint,
       station: station || undefined,
+      ...(FITTING_FIELD_ENABLED && fittingValue ? { fitting: fittingValue } : {}),
     });
     if (createErrors || !createdLoc) {
       // Amplify error objects carry their useful info on non-enumerable props
@@ -966,6 +1025,7 @@ function App() {
     setUserName("");
     setDescription("");
     setStation("");
+    setFitting("");
     setLat(0);
     setLng(0);
   }
@@ -1236,11 +1296,22 @@ function App() {
     // bug triggered by the `comments: a.ref('Comment').array()` custom type.
     const mutation = UPDATE_LOCATION_FULL;
     try {
+      const nextFitting = supportsFitting(editType) && editFitting !== '' ? editFitting : null;
+      if (nextFitting && !FITTING_FIELD_ENABLED) {
+        alert(
+          "The 'fitting' field has not been deployed to the backend yet.\n\n" +
+          "Run 'npx ampx sandbox' (or deploy the backend) so amplify_outputs.json includes Location.fitting, then reload."
+        );
+        return;
+      }
       const input: Record<string, unknown> = { id };
       input.date        = editDate;
       // AWSTime expects HH:MM:SS — pad the HH:MM value from the time control
       if (editTime) input.time = editTime.length === 5 ? `${editTime}:00` : editTime;
       input.type        = editType;
+      if (FITTING_FIELD_ENABLED) {
+        input.fitting   = nextFitting;
+      }
       input.description = editDescription;
       input.joint       = editJoint;
       input.station     = editStation !== '' ? editStation : null;
@@ -2284,7 +2355,11 @@ function App() {
       setPopupInfo({
         longitude: lng,
         latitude: lat,
-        properties: { ...props, joint: match?.joint ?? null },
+        properties: {
+          ...props,
+          joint: match?.joint ?? null,
+          fitting: match?.fitting ?? props.fitting ?? null,
+        },
       });
       setEditTrack(props.track != null ? String(props.track) : '');
       setEditDescription(props.description ?? '');
@@ -2294,6 +2369,7 @@ function App() {
       setEditLengthField(match?.lengthfield != null ? String(match.lengthfield) : '');
       setEditLengthOverwrite(match?.lengthoverwrite === true);
       setEditType(props.type ?? 'reuse');
+      setEditFitting(match?.fitting ?? props.fitting ?? '');
       setEditJoint(typeof match?.joint === 'string' ? match.joint : 'joint');
       setEditStation(match?.station ?? '');
       setEditDate(match?.date ?? props.date ?? '');
@@ -2322,6 +2398,7 @@ function App() {
         track: props.track != null ? String(props.track) : '',
         date: props.date ?? '',
         type: props.type ?? '',
+        fitting: props.fitting ?? null,
         length: props.length ?? null,
         lengthfield: props.lengthfield ?? null,
       });
@@ -2519,6 +2596,28 @@ function App() {
             })}
           </SelectField>
         </label>
+        {supportsFitting(type) && (
+          <label style={{ display: 'flex', flexDirection: 'column' }}>
+            <span style={{ fontSize: '10px', color: '#666' }}>Fitting</span>
+            <SelectField
+              label="Select a fitting"
+              labelHidden={true}
+              value={fitting}
+              onChange={(e) => setFitting(e.target.value)}
+            >
+              <option value="">None</option>
+              {FITTING_OPTIONS.map((option) => (
+                <option
+                  key={option.value}
+                  value={option.value}
+                  style={{ color: 'purple', fontWeight: 'bold' }}
+                >
+                  {option.label}
+                </option>
+              ))}
+            </SelectField>
+          </label>
+        )}
         <label style={{ display: 'flex', flexDirection: 'column' }}>
           <span style={{ fontSize: '10px', color: '#666' }}>Description</span>
           <Input
@@ -2739,6 +2838,9 @@ function App() {
                       <div><b>Track:</b> {hoverInfo.track}</div>
                       <div><b>Date:</b> {hoverInfo.date}</div>
                       <div><b>Type:</b> {hoverInfo.type}</div>
+                      {hoverInfo.fitting && (
+                        <div><b>Fitting:</b> {formatFittingLabel(hoverInfo.fitting)}</div>
+                      )}
                       <div><b>Length:</b> {hoverInfo.length != null ? hoverInfo.length.toFixed(2) : '—'}</div>
                       <div><b>Field Length:</b> {hoverInfo.lengthfield != null ? hoverInfo.lengthfield.toFixed(2) : '—'}</div>
                     </div>
@@ -2800,7 +2902,11 @@ function App() {
                                   <select
                                     aria-label="Type"
                                     value={editType}
-                                    onChange={e => setEditType(e.target.value)}
+                                    onChange={e => {
+                                      const nextType = e.target.value;
+                                      setEditType(nextType);
+                                      if (!supportsFitting(nextType)) setEditFitting('');
+                                    }}
                                     style={{
                                       position: 'absolute', inset: 0, width: '100%', height: '100%',
                                       opacity: 0, cursor: 'pointer',
@@ -2820,6 +2926,29 @@ function App() {
                                 </div>
                               </td>
                             </tr>
+                            {(supportsFitting(editType) || Boolean(editFitting)) && (
+                              <tr>
+                                <td>Fitting</td>
+                                <td>
+                                  <select
+                                    aria-label="Fitting"
+                                    value={editFitting}
+                                    onChange={e => setEditFitting(e.target.value)}
+                                    style={{ fontSize: '11px', padding: '2px 4px', width: '100%' }}
+                                  >
+                                    <option value="">None</option>
+                                    {editFitting && !FITTING_OPTIONS.some(o => o.value === editFitting) && (
+                                      <option value={editFitting}>{editFitting}</option>
+                                    )}
+                                    {FITTING_OPTIONS.map((opt) => (
+                                      <option key={opt.value} value={opt.value}>
+                                        {opt.label}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </td>
+                              </tr>
+                            )}
                             <tr>
                               <td>Track</td>
                               <td>
@@ -3212,6 +3341,7 @@ function App() {
                         <TableCell as="th">Station</TableCell>
                         <TableCell as="th">Width</TableCell>
                         <TableCell as="th" onClick={() => toggleHistorySort('type')} style={{ cursor: 'pointer', userSelect: 'none' }}>Type{historySortArrow('type')}</TableCell>
+                        <TableCell as="th">Fitting</TableCell>
                         <TableCell as="th" /* style={{ width: '15%' }} */>User</TableCell>
                         <TableCell as="th" /* style={{ width: '15%' }} */>Length-Cal</TableCell>
                         <TableCell as="th">Length-Field</TableCell>
@@ -3261,6 +3391,7 @@ function App() {
                           <TableCell>{location.station ?? '—'}</TableCell>
                           <TableCell /* width="10%" */>{location.width != null ? location.width : ''}</TableCell>
                           <TableCell /* width="15%" */>{historyTypeLabel(location)}</TableCell>
+                          <TableCell>{formatFittingLabel(location.fitting)}</TableCell>
                           <TableCell /* width="15%" */>{location.username}</TableCell>
                           <TableCell /* width="15%" */>{location.length != null ? Math.round(Number(location.length)) : ''}</TableCell>
                           <TableCell>{location.lengthfield != null ? Math.round(Number(location.lengthfield)) : ''}</TableCell>

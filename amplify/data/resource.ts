@@ -30,6 +30,7 @@ const schema = a.schema({
       comments: a.ref('Comment').array(),
       joint: a.string(),
       station: a.string(),
+      fitting: a.string(),
       dateId: a.id(),
       date_record: a.belongsTo('Date', 'dateId'),
       trackId: a.id(),

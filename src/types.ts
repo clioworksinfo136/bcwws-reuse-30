@@ -9,6 +9,7 @@ export interface WaterFeatureProperties {
   length: number | null;
   lengthfield: number | null;
   joint: string | null;
+  fitting?: string | null;
 }
 
 export interface WaterFeature {
